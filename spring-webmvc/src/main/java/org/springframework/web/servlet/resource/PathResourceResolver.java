@@ -150,23 +150,22 @@ public class PathResourceResolver extends AbstractResourceResolver {
 
 		for (Resource location : locations) {
 			try {
-				if (logger.isTraceEnabled()) {
-					logger.trace("Checking location: " + location);
-				}
 				String pathToUse = encodeIfNecessary(resourcePath, request, location);
 				Resource resource = getResource(pathToUse, location);
 				if (resource != null) {
-					if (logger.isTraceEnabled()) {
-						logger.trace("Found match: " + resource);
-					}
 					return resource;
-				}
-				else if (logger.isTraceEnabled()) {
-					logger.trace("No match for location: " + location);
 				}
 			}
 			catch (IOException ex) {
-				logger.trace("Failure checking for relative resource - trying next location", ex);
+				if (logger.isDebugEnabled()) {
+					String error = "Skip location [" + location + "] due to error";
+					if (logger.isTraceEnabled()) {
+						logger.trace(error, ex);
+					}
+					else {
+						logger.debug(error + ": " + ex.getMessage());
+					}
+				}
 			}
 		}
 		return null;
@@ -183,16 +182,16 @@ public class PathResourceResolver extends AbstractResourceResolver {
 	@Nullable
 	protected Resource getResource(String resourcePath, Resource location) throws IOException {
 		Resource resource = location.createRelative(resourcePath);
-		if (resource.exists() && resource.isReadable()) {
+		if (resource.isReadable()) {
 			if (checkResource(resource, location)) {
 				return resource;
 			}
-			else if (logger.isTraceEnabled()) {
+			else if (logger.isWarnEnabled()) {
 				Resource[] allowedLocations = getAllowedLocations();
-				logger.trace("Resource path=\"" + resourcePath + "\" was successfully resolved " +
-						"but resource=\"" +	resource.getURL() + "\" is neither under the " +
-						"current location=\"" + location.getURL() + "\" nor under any of the " +
-						"allowed locations=" + (allowedLocations != null ? Arrays.asList(allowedLocations) : "[]"));
+				logger.warn("Resource path \"" + resourcePath + "\" was successfully resolved " +
+						"but resource \"" +	resource.getURL() + "\" is neither under the " +
+						"current location \"" + location.getURL() + "\" nor under any of the " +
+						"allowed locations " + (allowedLocations != null ? Arrays.asList(allowedLocations) : "[]"));
 			}
 		}
 		return null;
@@ -284,14 +283,8 @@ public class PathResourceResolver extends AbstractResourceResolver {
 			// Use URLDecoder (vs UriUtils) to preserve potentially decoded UTF-8 chars...
 			try {
 				String decodedPath = URLDecoder.decode(resourcePath, "UTF-8");
-				int separatorIndex = decodedPath.indexOf("..") + 2;
-				if (separatorIndex > 1 && separatorIndex < decodedPath.length()) {
-					char separator = decodedPath.charAt(separatorIndex);
-					if (separator == '/' || separator == '\\') {
-						if (logger.isTraceEnabled()) {
-							logger.trace("Resolved resource path contains \"../\" after decoding: " + resourcePath);
-						}
-					}
+				if (decodedPath.contains("../") || decodedPath.contains("..\\")) {
+					logger.warn("Resolved resource path contains encoded \"../\" or \"..\\\": " + resourcePath);
 					return true;
 				}
 			}

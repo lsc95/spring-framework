@@ -44,6 +44,7 @@ import org.springframework.util.Assert;
 import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
 import org.springframework.util.PathMatcher;
+import org.springframework.util.StringUtils;
 
 /**
  * Implementation of {@link SubscriptionRegistry} that stores subscriptions
@@ -61,10 +62,10 @@ import org.springframework.util.PathMatcher;
  */
 public class DefaultSubscriptionRegistry extends AbstractSubscriptionRegistry {
 
-	/** Default maximum number of entries for the destination cache: 1024 */
+	/** Default maximum number of entries for the destination cache: 1024. */
 	public static final int DEFAULT_CACHE_LIMIT = 1024;
 
-	/** Static evaluation context to reuse */
+	/** Static evaluation context to reuse. */
 	private static EvaluationContext messageEvalContext =
 			SimpleEvaluationContext.forPropertyAccessors(new SimpMessageHeaderPropertyAccessor()).build();
 
@@ -73,6 +74,7 @@ public class DefaultSubscriptionRegistry extends AbstractSubscriptionRegistry {
 
 	private volatile int cacheLimit = DEFAULT_CACHE_LIMIT;
 
+	@Nullable
 	private String selectorHeaderName = "selector";
 
 	private volatile boolean selectorHeaderInUse = false;
@@ -114,26 +116,28 @@ public class DefaultSubscriptionRegistry extends AbstractSubscriptionRegistry {
 	}
 
 	/**
-	 * Configure the name of a selector header that a subscription message can
-	 * have in order to filter messages based on their headers. The value of the
-	 * header can use Spring EL expressions against message headers.
-	 * <p>For example the following expression expects a header called "foo" to
-	 * have the value "bar":
+	 * Configure the name of a header that a subscription message can have for
+	 * the purpose of filtering messages matched to the subscription. The header
+	 * value is expected to be a Spring EL boolean expression to be applied to
+	 * the headers of messages matched to the subscription.
+	 * <p>For example:
 	 * <pre>
 	 * headers.foo == 'bar'
 	 * </pre>
-	 * <p>By default this is set to "selector".
+	 * <p>By default this is set to "selector". You can set it to a different
+	 * name, or to {@code null} to turn off support for a selector header.
+	 * @param selectorHeaderName the name to use for a selector header
 	 * @since 4.2
 	 */
-	public void setSelectorHeaderName(String selectorHeaderName) {
-		Assert.notNull(selectorHeaderName, "'selectorHeaderName' must not be null");
-		this.selectorHeaderName = selectorHeaderName;
+	public void setSelectorHeaderName(@Nullable String selectorHeaderName) {
+		this.selectorHeaderName = StringUtils.hasText(selectorHeaderName) ? selectorHeaderName : null;
 	}
 
 	/**
-	 * Return the name for the selector header.
+	 * Return the name for the selector header name.
 	 * @since 4.2
 	 */
+	@Nullable
 	public String getSelectorHeaderName() {
 		return this.selectorHeaderName;
 	}
@@ -143,25 +147,32 @@ public class DefaultSubscriptionRegistry extends AbstractSubscriptionRegistry {
 	protected void addSubscriptionInternal(
 			String sessionId, String subsId, String destination, Message<?> message) {
 
+		Expression expression = getSelectorExpression(message.getHeaders());
+		this.subscriptionRegistry.addSubscription(sessionId, subsId, destination, expression);
+		this.destinationCache.updateAfterNewSubscription(destination, sessionId, subsId);
+	}
+
+	@Nullable
+	private Expression getSelectorExpression(MessageHeaders headers) {
 		Expression expression = null;
-		MessageHeaders headers = message.getHeaders();
-		String selector = SimpMessageHeaderAccessor.getFirstNativeHeader(getSelectorHeaderName(), headers);
-		if (selector != null) {
-			try {
-				expression = this.expressionParser.parseExpression(selector);
-				this.selectorHeaderInUse = true;
-				if (logger.isTraceEnabled()) {
-					logger.trace("Subscription selector: [" + selector + "]");
+		if (getSelectorHeaderName() != null) {
+			String selector = SimpMessageHeaderAccessor.getFirstNativeHeader(getSelectorHeaderName(), headers);
+			if (selector != null) {
+				try {
+					expression = this.expressionParser.parseExpression(selector);
+					this.selectorHeaderInUse = true;
+					if (logger.isTraceEnabled()) {
+						logger.trace("Subscription selector: [" + selector + "]");
+					}
 				}
-			}
-			catch (Throwable ex) {
-				if (logger.isDebugEnabled()) {
-					logger.debug("Failed to parse selector: " + selector, ex);
+				catch (Throwable ex) {
+					if (logger.isDebugEnabled()) {
+						logger.debug("Failed to parse selector: " + selector, ex);
+					}
 				}
 			}
 		}
-		this.subscriptionRegistry.addSubscription(sessionId, subsId, destination, expression);
-		this.destinationCache.updateAfterNewSubscription(destination, sessionId, subsId);
+		return expression;
 	}
 
 	@Override
@@ -196,8 +207,8 @@ public class DefaultSubscriptionRegistry extends AbstractSubscriptionRegistry {
 			return allMatches;
 		}
 		MultiValueMap<String, String> result = new LinkedMultiValueMap<>(allMatches.size());
-		for (String sessionId : allMatches.keySet()) {
-			for (String subId : allMatches.get(sessionId)) {
+		allMatches.forEach((sessionId, subIds) -> {
+			for (String subId : subIds) {
 				SessionSubscriptionInfo info = this.subscriptionRegistry.getSubscriptions(sessionId);
 				if (info == null) {
 					continue;
@@ -225,7 +236,7 @@ public class DefaultSubscriptionRegistry extends AbstractSubscriptionRegistry {
 					logger.debug("Failed to evaluate selector", ex);
 				}
 			}
-		}
+		});
 		return result;
 	}
 
@@ -237,15 +248,15 @@ public class DefaultSubscriptionRegistry extends AbstractSubscriptionRegistry {
 
 	/**
 	 * A cache for destinations previously resolved via
-	 * {@link DefaultSubscriptionRegistry#findSubscriptionsInternal(String, Message)}
+	 * {@link DefaultSubscriptionRegistry#findSubscriptionsInternal(String, Message)}.
 	 */
 	private class DestinationCache {
 
-		/** Map from destination -> <sessionId, subscriptionId> for fast look-ups */
+		/** Map from destination to {@code <sessionId, subscriptionId>} for fast look-ups. */
 		private final Map<String, LinkedMultiValueMap<String, String>> accessCache =
 				new ConcurrentHashMap<>(DEFAULT_CACHE_LIMIT);
 
-		/** Map from destination -> <sessionId, subscriptionId> with locking */
+		/** Map from destination to {@code <sessionId, subscriptionId>} with locking. */
 		@SuppressWarnings("serial")
 		private final Map<String, LinkedMultiValueMap<String, String>> updateCache =
 				new LinkedHashMap<String, LinkedMultiValueMap<String, String>>(DEFAULT_CACHE_LIMIT, 0.75f, true) {
@@ -270,8 +281,8 @@ public class DefaultSubscriptionRegistry extends AbstractSubscriptionRegistry {
 					for (SessionSubscriptionInfo info : subscriptionRegistry.getAllSubscriptions()) {
 						for (String destinationPattern : info.getDestinations()) {
 							if (getPathMatcher().match(destinationPattern, destination)) {
-								for (Subscription subscription : info.getSubscriptions(destinationPattern)) {
-									result.add(info.sessionId, subscription.getId());
+								for (Subscription sub : info.getSubscriptions(destinationPattern)) {
+									result.add(info.sessionId, sub.getId());
 								}
 							}
 						}
@@ -287,27 +298,23 @@ public class DefaultSubscriptionRegistry extends AbstractSubscriptionRegistry {
 
 		public void updateAfterNewSubscription(String destination, String sessionId, String subsId) {
 			synchronized (this.updateCache) {
-				for (Map.Entry<String, LinkedMultiValueMap<String, String>> entry : this.updateCache.entrySet()) {
-					String cachedDestination = entry.getKey();
+				this.updateCache.forEach((cachedDestination, subscriptions) -> {
 					if (getPathMatcher().match(destination, cachedDestination)) {
-						LinkedMultiValueMap<String, String> subs = entry.getValue();
 						// Subscription id's may also be populated via getSubscriptions()
-						List<String> subsForSession = subs.get(sessionId);
+						List<String> subsForSession = subscriptions.get(sessionId);
 						if (subsForSession == null || !subsForSession.contains(subsId)) {
-							subs.add(sessionId, subsId);
-							this.accessCache.put(cachedDestination, subs.deepCopy());
+							subscriptions.add(sessionId, subsId);
+							this.accessCache.put(cachedDestination, subscriptions.deepCopy());
 						}
 					}
-				}
+				});
 			}
 		}
 
 		public void updateAfterRemovedSubscription(String sessionId, String subsId) {
 			synchronized (this.updateCache) {
 				Set<String> destinationsToRemove = new HashSet<>();
-				for (Map.Entry<String, LinkedMultiValueMap<String, String>> entry : this.updateCache.entrySet()) {
-					String destination = entry.getKey();
-					LinkedMultiValueMap<String, String> sessionMap = entry.getValue();
+				this.updateCache.forEach((destination, sessionMap) -> {
 					List<String> subscriptions = sessionMap.get(sessionId);
 					if (subscriptions != null) {
 						subscriptions.remove(subsId);
@@ -321,7 +328,7 @@ public class DefaultSubscriptionRegistry extends AbstractSubscriptionRegistry {
 							this.accessCache.put(destination, sessionMap.deepCopy());
 						}
 					}
-				}
+				});
 				for (String destination : destinationsToRemove) {
 					this.updateCache.remove(destination);
 					this.accessCache.remove(destination);
@@ -332,9 +339,7 @@ public class DefaultSubscriptionRegistry extends AbstractSubscriptionRegistry {
 		public void updateAfterRemovedSession(SessionSubscriptionInfo info) {
 			synchronized (this.updateCache) {
 				Set<String> destinationsToRemove = new HashSet<>();
-				for (Map.Entry<String, LinkedMultiValueMap<String, String>> entry : this.updateCache.entrySet()) {
-					String destination = entry.getKey();
-					LinkedMultiValueMap<String, String> sessionMap = entry.getValue();
+				this.updateCache.forEach((destination, sessionMap) -> {
 					if (sessionMap.remove(info.getSessionId()) != null) {
 						if (sessionMap.isEmpty()) {
 							destinationsToRemove.add(destination);
@@ -343,7 +348,7 @@ public class DefaultSubscriptionRegistry extends AbstractSubscriptionRegistry {
 							this.accessCache.put(destination, sessionMap.deepCopy());
 						}
 					}
-				}
+				});
 				for (String destination : destinationsToRemove) {
 					this.updateCache.remove(destination);
 					this.accessCache.remove(destination);
@@ -433,13 +438,9 @@ public class DefaultSubscriptionRegistry extends AbstractSubscriptionRegistry {
 		public Subscription getSubscription(String subscriptionId) {
 			for (Map.Entry<String, Set<DefaultSubscriptionRegistry.Subscription>> destinationEntry :
 					this.destinationLookup.entrySet()) {
-
-				Set<Subscription> subs = destinationEntry.getValue();
-				if (subs != null) {
-					for (Subscription sub : subs) {
-						if (sub.getId().equalsIgnoreCase(subscriptionId)) {
-							return sub;
-						}
+				for (Subscription sub : destinationEntry.getValue()) {
+					if (sub.getId().equalsIgnoreCase(subscriptionId)) {
+						return sub;
 					}
 				}
 			}
